@@ -37,9 +37,9 @@ jobs:
           URL: https://catalog.apps.asu.edu/catalog/classes
           QUERIES_JSON: '[{"subject":"CSE","number":"412","term":"Spring 2026"}]'
           LOCATION_EXCLUDE: ASU Online
-          # jitter para intervalos ~10 min (8–12 min efectivos)
           JITTER_MIN_SEC: "0"
-          JITTER_MAX_SEC: "240"
+          JITTER_MAX_SEC: "240"           # ya lo tenías para 8–12 min efectivos
+          NOCHANGE_NOTIFY_INTERVAL_SEC: "3600"   # ← ping 1/h si no hay cambios
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor.py
