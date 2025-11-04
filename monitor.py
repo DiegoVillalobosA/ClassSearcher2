@@ -241,29 +241,81 @@ def extract_from_aria_grid(grid):
     return rows
 
 def extract_textual(page, subj, num):
-    """Fallback: parsea por texto cuando no hay tabla/grids accesibles."""
+    """
+    Fallback cuando no hay <table> ni ARIA grid.
+    Parseo por texto en bloques:
+      CSE 412
+      Database Management        <-- título
+      19439                      <-- NRC (5-6 dígitos)
+      ...
+      12:00 PM                   <-- Start (si existe)
+      ...
+      0 of 170                   <-- Open Seats (X of Y)
+    """
+    import re
     os.makedirs(DEBUG_DIR, exist_ok=True)
     body_txt = page.inner_text("body")
+
+    # Guarda el texto para depuración
     with open(f"{DEBUG_DIR}/after-search-text.txt", "w", encoding="utf-8") as f:
         f.write(body_txt)
 
-    # patrón: ... CSE 412 ... Number 19439 ... Open Seats 0 of 170 ...
-    pattern = rf'({re.escape(subj)}\s*{re.escape(num)}[^\n]{{0,200}}?)' \
-              rf'(?s).*?Number\s+(\d+).*?Open\s+Seats\s+(\d+)\s+of\s+(\d+)'
-    matches = list(re.finditer(pattern, body_txt, flags=re.IGNORECASE))
+    lines = [l.strip() for l in body_txt.splitlines()]
     rows = []
-    for m in matches:
-        course_label = re.sub(r'\s+', ' ', m.group(1)).strip()
-        nrc = m.group(2)
-        open_now = m.group(3)
-        open_total = m.group(4)
-        rows.append({
-            "nrc": nrc,
-            "course": course_label,
-            "seats": f"{open_now} of {open_total}",
-            "time": "",
-            "_raw": []
-        })
+
+    # Ej.: "CSE 412"
+    course_pat = re.compile(rf'^{re.escape(subj)}\s+{re.escape(num)}\b', re.IGNORECASE)
+
+    i = 0
+    while i < len(lines):
+        if course_pat.search(lines[i]):
+            # Course line (p.ej., "CSE 412")
+            course_label = lines[i].strip()
+
+            # Título: siguiente línea no vacía
+            j = i + 1
+            while j < len(lines) and not lines[j]:
+                j += 1
+            title = lines[j].strip() if j < len(lines) else ""
+
+            # NRC: primer número de 4–6 dígitos en las ~10–12 líneas siguientes
+            k = j + 1
+            nrc = ""
+            for t in lines[k:k+15]:
+                m = re.match(r'^\d{4,6}$', t)
+                if m:
+                    nrc = m.group(0)
+                    break
+
+            # Open Seats: "X of Y" en las próximas ~20 líneas
+            open_seats = ""
+            for t in lines[k:k+25]:
+                m2 = re.search(r'(\d+)\s+of\s+(\d+)', t, re.IGNORECASE)
+                if m2:
+                    open_seats = f"{m2.group(1)} of {m2.group(2)}"
+                    break
+
+            # Start time: primer hh:mm AM/PM en las próximas ~15 líneas
+            start_time = ""
+            for t in lines[k:k+15]:
+                m3 = re.search(r'\b(\d{1,2}:\d{2}\s*(AM|PM))\b', t, re.IGNORECASE)
+                if m3:
+                    start_time = m3.group(1)
+                    break
+
+            rows.append({
+                "nrc": nrc,
+                "course": f"{subj} {num} - {title}",
+                "seats": open_seats,
+                "time": start_time,
+            })
+
+            # Salta hacia delante para no volver a la misma sección
+            i = k + 10
+            continue
+
+        i += 1
+
     print(f"DEBUG: textual rows found = {len(rows)}")
     return rows
 
