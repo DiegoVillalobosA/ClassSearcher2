@@ -2,14 +2,20 @@ name: classwatcher
 
 on:
   schedule:
-    - cron: "7,37 * * * *"  # 2x per hour (UTC)
+    # dispara cada 5 min; el script duerme 5–10 min aleatorio antes de buscar
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
+
+concurrency:
+  group: classwatcher-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   run:
     permissions:
-      contents: write  # needed to commit state.json
+      contents: write  # para poder commitear state.json
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -22,6 +28,7 @@ jobs:
 
       - name: Install Playwright
         run: |
+          pip install --upgrade pip
           pip install playwright
           python -m playwright install --with-deps chromium
 
@@ -30,6 +37,9 @@ jobs:
           URL: https://catalog.apps.asu.edu/catalog/classes
           QUERIES_JSON: '[{"subject":"CSE","number":"412","term":"Spring 2026"}]'
           LOCATION_EXCLUDE: ASU Online
+          # jitter 5–10 min para no parecer bot
+          JITTER_MIN_SEC: "300"
+          JITTER_MAX_SEC: "600"
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor.py
@@ -42,7 +52,7 @@ jobs:
           path: |
             recordings/**
             debug/**
-  
+
       - name: Commit state if changed
         run: |
           if [ -n "$(git status --porcelain)" ]; then
