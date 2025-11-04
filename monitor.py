@@ -1,7 +1,7 @@
 import os, json, hashlib, time, random, urllib.request, urllib.parse, sys, traceback, re
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
 
-# ------- utils -------
+# ---------- utils ----------
 def load_json_env(key: str, default_val):
     raw = os.getenv(key)
     if not raw or not raw.strip():
@@ -27,15 +27,16 @@ def notify(text: str):
 def hash_rows(rows):
     return hashlib.sha256(json.dumps(rows, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
-# ------- config -------
+# ---------- config ----------
 URL = os.getenv("URL", "https://catalog.apps.asu.edu/catalog/classes")
 QUERIES = load_json_env("QUERIES_JSON", [{"subject":"CSE","number":"412","term":"Spring 2026"}])
 STATE = "state.json"
 DEBUG_DIR = "debug"
 VIDEO_DIR = "recordings"
 
-# ------- locators helpers -------
-def first_locator(page, kind, value, timeout=8000, name_regex=False):
+# ---------- locator helpers ----------
+def first_locator(page, kind, value, timeout=9000, name_regex=False):
+    import re as _re
     try:
         if kind == "label":
             loc = page.get_by_label(value, exact=False)
@@ -47,12 +48,7 @@ def first_locator(page, kind, value, timeout=8000, name_regex=False):
             loc = page.get_by_text(value, exact=False)
         elif kind == "role":
             role, name = value
-            if name_regex:
-                loc = page.get_by_role(role, name=re.compile(name, re.I))
-            else:
-                loc = page.get_by_role(role, name=name)
-        elif kind == "aria":
-            loc = page.locator(value)
+            loc = page.get_by_role(role, name=_re.compile(name, _re.I)) if name_regex else page.get_by_role(role, name=name)
         else:
             return None
         loc.first.wait_for(state="visible", timeout=timeout)
@@ -61,13 +57,7 @@ def first_locator(page, kind, value, timeout=8000, name_regex=False):
         return None
 
 def wait_hydrated(page, target_term_text: str):
-    """
-    Espera a que el buscador real esté montado (sin 'Previous Terms')
-    y muestre el Term correcto (o al menos no el temporal).
-    """
-    # espera botón Search Classes visible
-    first_locator(page, "role", ("button", "Search Classes")).wait_for(state="visible", timeout=15000)
-    # espera a que desaparezca 'Previous Terms' o aparezca target_term_text
+    first_locator(page, "role", ("button", "Search Classes")).wait_for(state="visible", timeout=20000)
     try:
         page.wait_for_function(
             """(term) => {
@@ -75,18 +65,17 @@ def wait_hydrated(page, target_term_text: str):
                 return (!txt.includes('Previous Terms')) || txt.includes(term);
             }""",
             arg=target_term_text,
-            timeout=12000
+            timeout=15000
         )
     except Exception:
         pass
-    # pequeño respiro para terminar animaciones/hydration
-    page.wait_for_timeout(400)
+    page.wait_for_timeout(500)
 
 def get_subject_input(page):
     for k, v in [
         ("placeholder", "Subject"),
         ("label", "Subject"),
-        ("aria", 'input[aria-label*="Subject" i]'),
+        ("css", 'input[aria-label*="Subject" i]'),
         ("css", '#subject'),
         ("css", 'input[name="subject"]'),
         ("css", 'input[id*="subject" i]'),
@@ -102,7 +91,7 @@ def get_number_input(page):
         ("placeholder", "Number"),
         ("label", "Number"),
         ("label", "Course Number"),
-        ("aria", 'input[aria-label*="Number" i]'),
+        ("css", 'input[aria-label*="Number" i]'),
         ("css", '#number'),
         ("css", 'input[name="number"]'),
         ("css", 'input[name="catalogNbr"]'),
@@ -117,11 +106,10 @@ def get_number_input(page):
     raise RuntimeError("No se encontró el campo 'Number'.")
 
 def set_term(page, term_label_text):
-    # intenta select nativo
     for k, v in [
         ("css", 'select[name="term"]'),
         ("css", "#term"),
-        ("aria", 'select[aria-label*="Term" i]'),
+        ("css", 'select[aria-label*="Term" i]'),
         ("label", "Term"),
     ]:
         loc = first_locator(page, k, v)
@@ -131,18 +119,16 @@ def set_term(page, term_label_text):
                 loc.select_option(label=term_label_text)
                 return
             except Exception as e:
-                print("DEBUG: select_option falló, probamos combobox...", e)
+                print("DEBUG: select_option fallo, probando combobox...", e)
                 break
-    # combobox
     combo = first_locator(page, "role", ("combobox", "Term"), name_regex=True)
     if combo:
-        print("DEBUG: term via role=combobox ~ 'Term'")
+        print("DEBUG: term via role=combobox")
         combo.click()
         opt = first_locator(page, "role", ("option", term_label_text))
         if opt: opt.click(); return
         opt2 = first_locator(page, "text", term_label_text)
         if opt2: opt2.click(); return
-    # fallback texto
     label = first_locator(page, "text", "Term")
     if label:
         try: label.click()
@@ -152,29 +138,28 @@ def set_term(page, term_label_text):
     raise RuntimeError("No se pudo seleccionar el Term.")
 
 def click_search(page):
+    clicked = False
     for k, v, regex in [
         ("role", ("button", "Search Classes"), False),
         ("role", ("button", r"Search\s*Classes"), True),
         ("text", "Search Classes", False),
         ("css", 'button:has-text("Search Classes")', False),
-        ("role", ("button", "Search"), False),
-        ("text", "Search", False),
-        ("css", 'input[type="submit"]', False),
     ]:
         loc = first_locator(page, k, v, name_regex=regex)
         if loc:
             print(f"DEBUG: search via {k}='{v}'")
             loc.click()
-            return
-    raise RuntimeError("No encontré el botón de búsqueda.")
+            clicked = True
+            break
+    if not clicked:
+        raise RuntimeError("No encontré el botón de búsqueda.")
+    # respaldo: Enter por si el click no dispara
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(800)
 
 def ensure_filters_applied(page, term, subj, num):
-    """
-    Comprueba que el encabezado de resultados contenga los filtros.
-    Retorna True si ya está aplicado; si no, False.
-    """
     try:
-        hdr = first_locator(page, "text", "Results for", timeout=8000)
+        first_locator(page, "text", "Results for", timeout=15000)
         txt = page.inner_text("body")
         ok = (term in txt) and (subj in txt) and (num in txt)
         print(f"DEBUG: header check -> {ok}")
@@ -182,34 +167,25 @@ def ensure_filters_applied(page, term, subj, num):
     except Exception:
         return False
 
-# ------- resultados (grid o table) -------
-def wait_results_component(page):
-    try:
-        first_locator(page, "text", "Results for").wait_for(state="visible", timeout=15000)
-        print("DEBUG: 'Results for' visible")
-    except Exception:
-        pass
-
+# ---------- resultados ----------
+def wait_component_or_none(page):
+    # grid/table ARIA
     for sel in ['[role="grid"]', '[role="table"]']:
         try:
             comp = page.locator(sel).first
-            comp.wait_for(state="visible", timeout=15000)
+            comp.wait_for(state="visible", timeout=12000)
             print(f"DEBUG: found {sel}")
             return ("grid", comp) if sel == '[role="grid"]' else ("table-aria", comp)
         except Exception:
             continue
-
-    tables = page.locator("table")
+    # table clásica
     try:
-        tables.first.wait_for(state="visible", timeout=15000)
-        return ("table", tables.first)
+        tbl = page.locator("table").first
+        tbl.wait_for(state="visible", timeout=8000)
+        print("DEBUG: found <table>")
+        return ("table", tbl)
     except Exception:
-        os.makedirs("debug", exist_ok=True)
-        page.screenshot(path="debug/after-search.png", full_page=True)
-        with open("debug/after-search.html","w",encoding="utf-8") as f:
-            f.write(page.content())
-        print("DEBUG: saved debug/after-search.png & .html")
-        raise RuntimeError("No apareció la tabla/grid de resultados; ajustar selectores.")
+        return (None, None)
 
 def find_col(headers, needle):
     needle = needle.lower()
@@ -220,7 +196,7 @@ def find_col(headers, needle):
 
 def extract_from_html_table(tbl):
     headers = [h.strip() for h in tbl.locator("th").all_inner_texts()]
-    print(f"DEBUG: chosen headers = {headers}")
+    print(f"DEBUG: headers = {headers}")
     idx_course = find_col(headers, "course")
     idx_number = find_col(headers, "number")
     idx_open   = find_col(headers, "open seats")
@@ -264,47 +240,74 @@ def extract_from_aria_grid(grid):
         })
     return rows
 
-def extract_rows(page):
-    typ, comp = wait_results_component(page)
+def extract_textual(page, subj, num):
+    """Fallback: parsea por texto cuando no hay tabla/grids accesibles."""
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    body_txt = page.inner_text("body")
+    with open(f"{DEBUG_DIR}/after-search-text.txt", "w", encoding="utf-8") as f:
+        f.write(body_txt)
+
+    # patrón: ... CSE 412 ... Number 19439 ... Open Seats 0 of 170 ...
+    pattern = rf'({re.escape(subj)}\s*{re.escape(num)}[^\n]{{0,200}}?)' \
+              rf'(?s).*?Number\s+(\d+).*?Open\s+Seats\s+(\d+)\s+of\s+(\d+)'
+    matches = list(re.finditer(pattern, body_txt, flags=re.IGNORECASE))
+    rows = []
+    for m in matches:
+        course_label = re.sub(r'\s+', ' ', m.group(1)).strip()
+        nrc = m.group(2)
+        open_now = m.group(3)
+        open_total = m.group(4)
+        rows.append({
+            "nrc": nrc,
+            "course": course_label,
+            "seats": f"{open_now} of {open_total}",
+            "time": "",
+            "_raw": []
+        })
+    print(f"DEBUG: textual rows found = {len(rows)}")
+    return rows
+
+def extract_rows(page, subj, num):
+    typ, comp = wait_component_or_none(page)
     if typ == "table":
         return extract_from_html_table(comp)
-    else:
+    elif typ in ("grid", "table-aria"):
         return extract_from_aria_grid(comp)
+    else:
+        return extract_textual(page, subj, num)
 
-# ------- flujo principal -------
-def apply_filters_and_search(page, subj, num, term, tries=2):
+# ---------- flujo principal ----------
+def apply_filters_and_search(page, subj, num, term, tries=3):
     for attempt in range(1, tries+1):
         print(f"DEBUG: attempt {attempt}")
         wait_hydrated(page, term)
 
-        # SIEMPRE toma locators frescos (post-hydration)
-        subj_input = get_subject_input(page)
-        num_input  = get_number_input(page)
-
-        # Limpia y rellena
+        # inputs FRESCOS (post-hydration)
+        s_in = get_subject_input(page)
+        n_in = get_number_input(page)
         try:
-            subj_input.fill("")
-            num_input.fill("")
+            s_in.fill(""); n_in.fill("")
         except Exception:
             pass
-        subj_input.fill(subj)
-        num_input.fill(num)
+        s_in.fill(subj)
+        n_in.fill(num)
 
         set_term(page, term)
         click_search(page)
+
         page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(1000)  # pequeño respiro
 
         if ensure_filters_applied(page, term, subj, num):
             return True
 
-        # Si no aplicó, intenta otra vez (barra de búsqueda también existe en resultados)
         print("DEBUG: filters not applied, retrying...")
-        page.wait_for_timeout(600)
+        page.wait_for_timeout(700)
 
     return False
 
 def run():
-    time.sleep(random.uniform(0, 5))  # jitter
+    time.sleep(random.uniform(0, 5))
     os.makedirs(DEBUG_DIR, exist_ok=True)
 
     with sync_playwright() as p:
@@ -323,13 +326,12 @@ def run():
 
             ok = apply_filters_and_search(page, subj, num, term, tries=3)
             if not ok:
-                # guarda diagnóstico
                 page.screenshot(path=f"{DEBUG_DIR}/failed-{subj}{num}.png", full_page=True)
                 with open(f"{DEBUG_DIR}/failed-{subj}{num}.html","w",encoding="utf-8") as f:
                     f.write(page.content())
                 raise RuntimeError("No se pudo aplicar filtros tras reintentos.")
 
-            rows = extract_rows(page)
+            rows = extract_rows(page, subj, num)
             for r in rows:
                 r["_query"] = f"{subj}{num}-{term}"
             all_rows.extend(rows)
