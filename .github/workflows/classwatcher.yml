@@ -29,11 +29,10 @@ jobs:
         env:
           URL: https://catalog.apps.asu.edu/catalog/classes
           QUERIES_JSON: '[{"subject":"CSE","number":"412","term":"Spring 2026"}]'
-          # TODO: replace these placeholders with the real selectors from ASU’s page
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor.py
-
+  
       - name: Commit state if changed
         run: |
           if [ -n "$(git status --porcelain)" ]; then
