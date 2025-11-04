@@ -445,12 +445,17 @@ def run():
     old_map = {r.get("nrc"): r for r in old_rows if r.get("nrc")}
     new_map = {r.get("nrc"): r for r in all_rows if r.get("nrc")}
 
-    # Mensaje lindo con delta y emojis
-    lines = []
+    def parse_open_pair(s):
+        m = re.search(r'(\d+)\s*of\s*(\d+)', s or '', re.I)
+        return (int(m.group(1)), int(m.group(2))) if m else (None, None)
+
+    # Construir mensaje SIEMPRE
+    header = f'Class Watch — {time.strftime("%Y-%m-%d %H:%M UTC")}'
+    lines = [header]
+
     for nrc, r in sorted(new_map.items(), key=lambda kv: kv[0]):
         cur_open, cur_tot = parse_open_pair(r.get("seats"))
         prev = old_map.get(nrc)
-        delta_txt = "(new)"
         if prev:
             prev_open, _ = parse_open_pair(prev.get("seats"))
             if prev_open is not None and cur_open is not None:
@@ -458,6 +463,8 @@ def run():
                 delta_txt = f"(Δ {diff:+d})" if diff != 0 else "(same)"
             else:
                 delta_txt = "(same)"
+        else:
+            delta_txt = "(new)"
 
         if cur_open is None:
             open_str = r.get("seats","?")
@@ -466,9 +473,9 @@ def run():
             open_str = f"{cur_open}/{cur_tot}"
             emoji = "🟢" if cur_open > 0 else "🔴"
 
-        instructor = r.get("instructor","").strip() or "TBA"
-        location   = r.get("location","").strip() or "-"
-        start_time = r.get("time","").strip() or "-"
+        instructor = (r.get("instructor","") or "TBA").strip()
+        location   = (r.get("location","") or "-").strip()
+        start_time = (r.get("time","") or "-").strip()
 
         lines.append(
             f'{emoji} Class {nrc} — {r.get("course","")} — {instructor} — '
@@ -480,8 +487,11 @@ def run():
         gone = ", ".join(sorted([x.get("nrc","") for x in removed]))
         lines.append(f'Removed: {gone}')
 
+    # Enviar SIEMPRE
+    notify("\n".join(lines) if len(lines) > 1 else "No sections found (after filtering).")
+
+    # Solo actualizar state cuando cambie
     if old_state.get("hash") != new_state["hash"]:
-        notify("\n".join(lines) if lines else "No sections found (after filtering).")
         with open(STATE, "w") as f:
             json.dump(new_state, f)
         print("CHANGED")
