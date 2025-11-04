@@ -496,7 +496,7 @@ def run():
             json.dump(new_state, f)
         print("CHANGED")
     else:
-        print("NOCHANGE")
+        print("NOCHANGE") 
 
 if __name__ == "__main__":
     try:
