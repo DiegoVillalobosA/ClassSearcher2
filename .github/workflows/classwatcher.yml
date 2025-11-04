@@ -29,6 +29,7 @@ jobs:
         env:
           URL: https://catalog.apps.asu.edu/catalog/classes
           QUERIES_JSON: '[{"subject":"CSE","number":"412","term":"Spring 2026"}]'
+          LOCATION_EXCLUDE: ASU Online
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor.py
