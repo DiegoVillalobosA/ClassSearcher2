@@ -2,8 +2,8 @@ name: classwatcher
 
 on:
   schedule:
-    # dispara cada 5 min; el script duerme 5–10 min aleatorio antes de buscar
-    - cron: "*/5 * * * *"
+    # corre cada 8 min (UTC); con jitter de 0–4 min en el script => 8–12 min reales
+    - cron: "*/8 * * * *"
   workflow_dispatch: {}
 
 concurrency:
@@ -13,7 +13,7 @@ concurrency:
 jobs:
   run:
     permissions:
-      contents: write  # para poder commitear state.json
+      contents: write
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -37,15 +37,16 @@ jobs:
           URL: https://catalog.apps.asu.edu/catalog/classes
           QUERIES_JSON: '[{"subject":"CSE","number":"412","term":"Spring 2026"}]'
           LOCATION_EXCLUDE: ASU Online
-          # jitter 5–10 min para no parecer bot
-          JITTER_MIN_SEC: "300"
-          JITTER_MAX_SEC: "600"
+          # jitter para intervalos 8–12 min
+          JITTER_MIN_SEC: "0"
+          JITTER_MAX_SEC: "240"
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor.py
 
+      # Subir artefactos SÓLO si falla, o si es un muestreo "1 vez por hora" (~cada 6 runs)
       - name: Upload debug artifacts (video + screenshots + html)
-        if: always()
+        if: failure() || (success() && (github.run_number % 6 == 0))
         uses: actions/upload-artifact@v4
         with:
           name: debug-${{ github.run_id }}
