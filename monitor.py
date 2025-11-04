@@ -1,7 +1,7 @@
 import os, json, hashlib, time, random, urllib.request, urllib.parse, sys, traceback, re
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# ---------- util: JSON seguro desde env ----------
+# -------- util: JSON seguro desde env --------
 def load_json_env(key: str, default_val):
     raw = os.getenv(key)
     if not raw or not raw.strip():
@@ -12,7 +12,7 @@ def load_json_env(key: str, default_val):
         print(f"WARN: invalid {key}; using defaults. Error:", e)
         return default_val
 
-# ---------- config ----------
+# -------- config --------
 URL = os.getenv("URL", "https://catalog.apps.asu.edu/catalog/classes")
 DEFAULT_QUERIES = [{"subject": "CSE", "number": "412", "term": "Spring 2026"}]
 QUERIES = load_json_env("QUERIES_JSON", DEFAULT_QUERIES)
@@ -21,7 +21,10 @@ STATE = "state.json"
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ---------- notificaciones ----------
+DEBUG_DIR = "debug"
+VIDEO_DIR = "recordings"
+
+# -------- notificaciones --------
 def notify(text: str):
     if TG_TOKEN and TG_CHAT:
         try:
@@ -35,8 +38,8 @@ def notify(text: str):
 def hash_rows(rows):
     return hashlib.sha256(json.dumps(rows, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
-# ---------- helpers de localización ----------
-def first_locator(page, kind, value, timeout=6000, name_regex=False):
+# -------- helpers de localización --------
+def first_locator(page, kind, value, timeout=8000, name_regex=False):
     try:
         if kind == "label":
             loc = page.get_by_label(value, exact=False)
@@ -71,7 +74,7 @@ def find_subject_input(page):
         ("css", 'input[id*="subject" i]'),
     ]:
         loc = first_locator(page, k, v)
-        if loc: 
+        if loc:
             print(f"DEBUG: subject via {k}='{v}'")
             return loc
     raise RuntimeError("No se encontró el campo 'Subject'.")
@@ -96,7 +99,7 @@ def find_number_input(page):
     raise RuntimeError("No se encontró el campo 'Number'.")
 
 def select_term_value(page, term_label_text):
-    # 1) select nativo
+    # select nativo
     for k, v in [
         ("css", 'select[name="term"]'),
         ("css", "#term"),
@@ -112,7 +115,7 @@ def select_term_value(page, term_label_text):
             except Exception as e:
                 print("DEBUG: select_option falló, probamos combobox...", e)
                 break
-    # 2) combobox accesible (muy común en UI custom)
+    # combobox accesible
     combo = first_locator(page, "role", ("combobox", "Term"), name_regex=True)
     if combo:
         print("DEBUG: term via role=combobox ~ 'Term'")
@@ -123,7 +126,7 @@ def select_term_value(page, term_label_text):
         opt2 = first_locator(page, "text", term_label_text)
         if opt2:
             opt2.click(); return True
-    # 3) fallback por texto
+    # fallback por texto
     label = first_locator(page, "text", "Term")
     if label:
         try: label.click()
@@ -131,7 +134,7 @@ def select_term_value(page, term_label_text):
         opt3 = first_locator(page, "text", term_label_text)
         if opt3:
             opt3.click(); return True
-    raise RuntimeError("No se pudo seleccionar el Term (ajusta lógica o dime el locator).")
+    raise RuntimeError("No se pudo seleccionar el Term.")
 
 def click_search(page):
     for k, v, regex in [
@@ -148,67 +151,108 @@ def click_search(page):
             print(f"DEBUG: search via {k}='{v}'")
             loc.click()
             return True
-    raise RuntimeError("No encontré el botón de búsqueda (Search Classes).")
+    raise RuntimeError("No encontré el botón de búsqueda.")
 
 def wait_results_table(page):
-    # Varias heurísticas; la de Open Seats suele ser estable en ASU
-    for k, v in [
-        ("css", 'table:has-text("Open Seats")'),
-        ("css", "table.results"),
-        ("css", "table#results"),
-        ("css", 'table:has(th)'),
-        ("css", 'div[class*="result" i] table'),
-    ]:
-        try:
-            loc = page.locator(v).first
-            loc.wait_for(state="visible", timeout=60000)
-            print(f"DEBUG: table via {k}='{v}'")
-            return loc
-        except Exception:
-            continue
-    # Como extra, el texto grande de cabecera: "Results for Spring 2026, CSE, 412"
-    hdr = first_locator(page, "text", "Results for", timeout=6000)
-    if hdr:
-        # espera un poco extra y reintenta tablas genéricas
-        page.wait_for_timeout(1000)
-        for v in ["table", "table:has(th)"]:
+    # espera cabecera "Results for ..."
+    try:
+        first_locator(page, "text", "Results for").wait_for(state="visible", timeout=15000)
+        print("DEBUG: 'Results for' visible")
+    except Exception:
+        pass
+
+    # intenta varias tablas y muestra diagnóstico
+    tables = page.locator("table")
+    try:
+        tables.first.wait_for(state="visible", timeout=15000)
+    except Exception:
+        pass
+
+    count = tables.count()
+    print(f"DEBUG: tables found = {count}")
+    chosen = None
+    for i in range(min(count, 10)):
+        ths = tables.nth(i).locator("th")
+        headers = [h.strip() for h in ths.all_inner_texts()]
+        print(f"DEBUG: table[{i}] headers = {headers}")
+        # busca una que tenga columnas típicas
+        if any("course" in h.lower() for h in headers) and any("open seats" in h.lower() for h in headers):
+            chosen = tables.nth(i)
+            print(f"DEBUG: using table[{i}]")
+            break
+
+    if not chosen:
+        # otros intentos
+        for k, v in [
+            ('css', 'table:has-text("Open Seats")'),
+            ('css', 'div[class*="result" i] table'),
+            ('css', 'main table'),
+        ]:
             try:
                 loc = page.locator(v).first
-                loc.wait_for(state="visible", timeout=6000)
-                print(f"DEBUG: table via fallback '{v}'")
-                return loc
+                loc.wait_for(state="visible", timeout=10000)
+                print(f"DEBUG: table via {k}='{v}'")
+                chosen = loc
+                break
             except Exception:
-                pass
-    raise RuntimeError("No apareció la tabla de resultados; ajusta selector de tabla.")
+                continue
+
+    if not chosen:
+        # guardar diagnóstico visual
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        try:
+            page.screenshot(path=f"{DEBUG_DIR}/after-search.png", full_page=True)
+            with open(f"{DEBUG_DIR}/after-search.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+            print("DEBUG: saved debug/after-search.png & .html")
+        except Exception as e:
+            print("DEBUG: failed to save debug artifacts:", e)
+        raise RuntimeError("No apareció la tabla de resultados; ajusta selector de tabla.")
+
+    return chosen
+
+def find_col(headers, needle):
+    needle = needle.lower()
+    for i, h in enumerate(headers):
+        if needle in h.lower():
+            return i
+    return None
 
 def extract_rows(page):
     tbl = wait_results_table(page)
+    headers = [h.strip() for h in tbl.locator("th").all_inner_texts()]
+    print(f"DEBUG: chosen headers = {headers}")
+
+    idx_course = find_col(headers, "course")
+    idx_number = find_col(headers, "number")
+    idx_open   = find_col(headers, "open seats")
+    idx_time   = find_col(headers, "time") or find_col(headers, "start")
+
     rows = []
     trs = tbl.locator("tbody tr")
-    count = trs.count()
-    for i in range(count):
+    for i in range(trs.count()):
         tds = trs.nth(i).locator("td")
-        n = tds.count()
-        vals = [tds.nth(j).inner_text().strip() for j in range(n)]
-        if n >= 5:
-            rows.append({
-                "nrc":     vals[0],
-                "course":  vals[1],
-                "seats":   vals[10] if n > 10 else (vals[2] if n > 2 else ""),  # Open Seats suele estar en la 11ª col
-                "wait":    "",   # agrega si existe columna de waitlist en tu vista
-                "time":    vals[6] if n > 6 else "",
-                "_raw":    vals
-            })
-        else:
-            rows.append({"_raw": vals})
+        texts = [tds.nth(j).inner_text().strip() for j in range(tds.count())]
+        rows.append({
+            "nrc":   texts[idx_number] if idx_number is not None and idx_number < len(texts) else "",
+            "course":texts[idx_course] if idx_course is not None and idx_course < len(texts) else "",
+            "seats": texts[idx_open]   if idx_open   is not None and idx_open   < len(texts) else "",
+            "time":  texts[idx_time]   if idx_time   is not None and idx_time   < len(texts) else "",
+            "_raw":  texts
+        })
     return rows
 
-# ---------- main ----------
+# -------- main --------
 def run():
     time.sleep(random.uniform(0, 5))  # jitter
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page()
+        # graba video (podrás verlo en Actions como artifact)
+        context = browser.new_context(record_video_dir=VIDEO_DIR, viewport={"width": 1366, "height": 768})
+        page = context.new_page()
+
         page.goto(URL, wait_until="domcontentloaded", timeout=60000)
 
         all_rows = []
@@ -227,13 +271,14 @@ def run():
             select_term_value(page, term)
             click_search(page)
 
-            # espera a que cargue algo de red y render
             page.wait_for_load_state("networkidle")
             rows = extract_rows(page)
             for r in rows:
                 r["_query"] = f"{subj}{num}-{term}"
             all_rows.extend(rows)
 
+        # cierra guardando los videos
+        context.close()
         browser.close()
 
     new_state = {"hash": hash_rows(all_rows), "rows": all_rows, "ts": int(time.time())}
