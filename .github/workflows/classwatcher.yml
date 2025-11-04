@@ -30,7 +30,6 @@ jobs:
           URL: https://catalog.apps.asu.edu/catalog/classes
           QUERIES_JSON: '[{"subject":"CSE","number":"412","term":"Spring 2026"}]'
           # TODO: replace these placeholders with the real selectors from ASU’s page
-          SELECTORS_JSON: '{"subject":"input[name=\"subject\"]","number":"input[name=\"number\"]","term":"select[name=\"term\"]","search\":\"button:has-text(\\\"Search\\\")\",\"table\":\"table.results\"}'
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor.py
