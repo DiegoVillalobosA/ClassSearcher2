@@ -2,7 +2,7 @@ name: classwatcher
 
 on:
   schedule:
-    # corre cada 8 min (UTC); con jitter de 0–4 min en el script => 8–12 min reales
+    # corre cada 8 min (UTC); con jitter 0–4 min en el script => 8–12 min reales
     - cron: "*/8 * * * *"
   workflow_dispatch: {}
 
@@ -37,22 +37,33 @@ jobs:
           URL: https://catalog.apps.asu.edu/catalog/classes
           QUERIES_JSON: '[{"subject":"CSE","number":"412","term":"Spring 2026"}]'
           LOCATION_EXCLUDE: ASU Online
-          # jitter para intervalos 8–12 min
+          # jitter para intervalos ~10 min (8–12 min efectivos)
           JITTER_MIN_SEC: "0"
           JITTER_MAX_SEC: "240"
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor.py
 
-      # Subir artefactos SÓLO si falla, o si es un muestreo "1 vez por hora" (~cada 6 runs)
+      # Calcula si toca subir artefactos por muestreo (1 vez aprox. por hora = cada 6 corridas)
+      - name: Decide artifact sampling (once an hour)
+        id: sample
+        run: |
+          RUN=${{ github.run_number }}
+          if [ $((RUN % 6)) -eq 0 ]; then
+            echo "upload=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "upload=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Upload debug artifacts (video + screenshots + html)
-        if: failure() || (success() && (github.run_number % 6 == 0))
+        if: failure() || (success() && steps.sample.outputs.upload == 'true')
         uses: actions/upload-artifact@v4
         with:
           name: debug-${{ github.run_id }}
           path: |
             recordings/**
             debug/**
+          if-no-files-found: ignore
 
       - name: Commit state if changed
         run: |
@@ -63,5 +74,3 @@ jobs:
             git commit -m "update state [skip ci]" || true
             git push
           fi
-
-#cool
