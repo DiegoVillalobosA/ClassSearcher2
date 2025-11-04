@@ -34,9 +34,12 @@ STATE = "state.json"
 DEBUG_DIR = "debug"
 VIDEO_DIR = "recordings"
 
-# Excluir SOLO estas ubicaciones (por texto, case-insensitive).
-# Pediste excluir "ASU Online" y mantener iCourse y demás campus.
+# Excluir SOLO estas ubicaciones (texto, case-insensitive)
 LOCATION_EXCLUDE = [s.strip().lower() for s in os.getenv("LOCATION_EXCLUDE", "ASU Online").split("|") if s.strip()]
+
+# Jitter aleatorio (para que cada corrida no sea a minuto exacto)
+JITTER_MIN_SEC = int(os.getenv("JITTER_MIN_SEC", "300"))  # 5 min
+JITTER_MAX_SEC = int(os.getenv("JITTER_MAX_SEC", "600"))  # 10 min
 
 # -------------------- locator helpers --------------------
 def first_locator(page, kind, value, timeout=9000, name_regex=False):
@@ -198,6 +201,7 @@ def find_col(headers, needle):
 def extract_from_html_table(tbl):
     headers = [h.strip() for h in tbl.locator("th").all_inner_texts()]
     print(f"DEBUG: headers = {headers}")
+
     idx_course = find_col(headers, "course")
     idx_number = find_col(headers, "number")
     idx_open   = find_col(headers, "open seats")
@@ -205,25 +209,42 @@ def extract_from_html_table(tbl):
     idx_instr  = find_col(headers, "instructor")
     idx_loc    = find_col(headers, "location")
 
-    rows = []
+    # algunas filas traen celdas "extra" (expander / favoritos). Calculamos offset:
     trs = tbl.locator("tbody tr")
+    if trs.count() == 0:
+        return []
+    first_tds = trs.nth(0).locator("td")
+    offset = max(0, first_tds.count() - len(headers))
+    print(f"DEBUG: column offset = {offset}")
+
+    def _get(texts, idx):
+        if idx is None: return ""
+        pos = offset + idx
+        return texts[pos] if 0 <= pos < len(texts) else ""
+
+    rows = []
     for i in range(trs.count()):
         tds = trs.nth(i).locator("td")
         texts = [tds.nth(j).inner_text().strip() for j in range(tds.count())]
+        instr = _get(texts, idx_instr)
+        # sanity: si por error es un número de 5-6 dígitos, no es profe
+        if re.fullmatch(r"\d{4,6}", instr or ""):
+            instr = ""
         rows.append({
-            "nrc":       texts[idx_number] if idx_number is not None and idx_number < len(texts) else "",
-            "course":    texts[idx_course] if idx_course is not None and idx_course < len(texts) else "",
-            "seats":     texts[idx_open]   if idx_open   is not None and idx_open   < len(texts) else "",
-            "time":      texts[idx_start]  if idx_start  is not None and idx_start  < len(texts) else "",
-            "instructor":texts[idx_instr]  if idx_instr  is not None and idx_instr  < len(texts) else "",
-            "location":  texts[idx_loc]    if idx_loc    is not None and idx_loc    < len(texts) else "",
-            "_raw":      texts
+            "nrc":        _get(texts, idx_number),
+            "course":     _get(texts, idx_course),
+            "seats":      _get(texts, idx_open),
+            "time":       _get(texts, idx_start),
+            "instructor": instr,
+            "location":   _get(texts, idx_loc),
+            "_raw":       texts
         })
     return rows
 
 def extract_from_aria_grid(grid):
     headers = [h.strip() for h in grid.locator('[role="columnheader"]').all_inner_texts()]
     print(f"DEBUG: ARIA headers = {headers}")
+
     idx_course = find_col(headers, "course")
     idx_number = find_col(headers, "number")
     idx_open   = find_col(headers, "open seats")
@@ -231,29 +252,38 @@ def extract_from_aria_grid(grid):
     idx_instr  = find_col(headers, "instructor")
     idx_loc    = find_col(headers, "location")
 
-    rows = []
     all_rows = grid.locator('[role="row"]')
+    # primera fila real
+    first_cells = all_rows.nth(1).locator('[role="gridcell"], [role="cell"]') if all_rows.count() > 1 else grid.locator('[role="gridcell"], [role="cell"]')
+    offset = max(0, first_cells.count() - len(headers))
+    print(f"DEBUG: ARIA column offset = {offset}")
+
+    def _get(texts, idx):
+        if idx is None: return ""
+        pos = offset + idx
+        return texts[pos] if 0 <= pos < len(texts) else ""
+
+    rows = []
     for i in range(all_rows.count()):
         cells = all_rows.nth(i).locator('[role="gridcell"], [role="cell"]')
         if cells.count() == 0:
             continue
         texts = [cells.nth(j).inner_text().strip() for j in range(cells.count())]
+        instr = _get(texts, idx_instr)
+        if re.fullmatch(r"\d{4,6}", instr or ""):
+            instr = ""
         rows.append({
-            "nrc":       texts[idx_number] if idx_number is not None and idx_number < len(texts) else "",
-            "course":    texts[idx_course] if idx_course is not None and idx_course < len(texts) else "",
-            "seats":     texts[idx_open]   if idx_open   is not None and idx_open   < len(texts) else "",
-            "time":      texts[idx_start]  if idx_start  is not None and idx_start  < len(texts) else "",
-            "instructor":texts[idx_instr]  if idx_instr  is not None and idx_instr  < len(texts) else "",
-            "location":  texts[idx_loc]    if idx_loc    is not None and idx_loc    < len(texts) else "",
-            "_raw":      texts
+            "nrc":        _get(texts, idx_number),
+            "course":     _get(texts, idx_course),
+            "seats":      _get(texts, idx_open),
+            "time":       _get(texts, idx_start),
+            "instructor": instr,
+            "location":   _get(texts, idx_loc),
+            "_raw":       texts
         })
     return rows
 
 def extract_textual(page, subj, num):
-    """
-    Fallback sin tabla/ARIA: parseo por líneas.
-    Saca: class number, título, open seats, hora, instructor y ubicación.
-    """
     os.makedirs(DEBUG_DIR, exist_ok=True)
     body_txt = page.inner_text("body")
     with open(f"{DEBUG_DIR}/after-search-text.txt", "w", encoding="utf-8") as f:
@@ -272,7 +302,6 @@ def extract_textual(page, subj, num):
                 j += 1
             title = lines[j].strip() if j < len(lines) else ""
 
-            # Instructor (heurístico)
             instr = ""
             k = j + 1
             for t in lines[k:k+8]:
@@ -281,27 +310,24 @@ def extract_textual(page, subj, num):
                 if re.search(r'\b(AM|PM)\b', t, re.IGNORECASE): continue
                 if "Open Seats" in t or "Add" == t: continue
                 if re.search(r'(Tempe|Downtown|West|Poly|Online|iCourse)', t, re.IGNORECASE): continue
+                if re.fullmatch(r"\d{4,6}", t): continue
                 instr = t; break
 
-            # Class number
             nrc = ""
             for t in lines[k:k+15]:
                 m = re.match(r'^\d{4,6}$', t)
                 if m: nrc = m.group(0); break
 
-            # Open Seats
             open_seats = ""
             for t in lines[k:k+25]:
                 m2 = re.search(r'(\d+)\s+of\s+(\d+)', t, re.IGNORECASE)
                 if m2: open_seats = f"{m2.group(1)} of {m2.group(2)}"; break
 
-            # Start time
             start_time = ""
             for t in lines[k:k+15]:
                 m3 = re.search(r'\b(\d{1,2}:\d{2}\s*(AM|PM))\b', t, re.IGNORECASE)
                 if m3: start_time = m3.group(1); break
 
-            # Location
             location = ""
             for t in lines[k:k+25]:
                 if re.search(r'\bASU\s+Online\b', t, re.IGNORECASE):
@@ -368,7 +394,11 @@ def parse_open_pair(s):
     return (int(m.group(1)), int(m.group(2))) if m else (None, None)
 
 def run():
-    time.sleep(random.uniform(0, 5))
+    # --- JITTER aleatorio 5-10 min ---
+    jitter = random.randint(JITTER_MIN_SEC, JITTER_MAX_SEC)
+    print(f"DEBUG: jitter sleep {jitter}s")
+    time.sleep(jitter)
+
     os.makedirs(DEBUG_DIR, exist_ok=True)
 
     with sync_playwright() as p:
@@ -400,11 +430,11 @@ def run():
         context.close()
         browser.close()
 
-    # --- Filtro: excluir SOLO "ASU Online" (u otros que pongas en LOCATION_EXCLUDE) ---
+    # Filtro: excluir "ASU Online"
     if LOCATION_EXCLUDE:
         all_rows = [r for r in all_rows if not any(x in (r.get("location","").lower()) for x in LOCATION_EXCLUDE)]
 
-    # --- Estado nuevo/antiguo ---
+    # Estado nuevo/antiguo
     new_state = {"hash": hash_rows(all_rows), "rows": all_rows, "ts": int(time.time())}
     try:
         old_state = json.load(open(STATE, "r"))
@@ -415,9 +445,9 @@ def run():
     old_map = {r.get("nrc"): r for r in old_rows if r.get("nrc")}
     new_map = {r.get("nrc"): r for r in all_rows if r.get("nrc")}
 
-    # --- Mensaje "bonito" con delta por cada clase actual ---
+    # Mensaje lindo con delta y emojis
     lines = []
-    for nrc, r in sorted(new_map.items(), key=lambda kv: kv[0]):  # por class number
+    for nrc, r in sorted(new_map.items(), key=lambda kv: kv[0]):
         cur_open, cur_tot = parse_open_pair(r.get("seats"))
         prev = old_map.get(nrc)
         delta_txt = "(new)"
@@ -429,20 +459,27 @@ def run():
             else:
                 delta_txt = "(same)"
 
-        open_str = f"{cur_open}/{cur_tot}" if cur_open is not None else (r.get("seats","?"))
-        # Ej.: Class 38851 — CSE 412 - Database Management — Jia Zou — Open 2/170 (Δ 0) — Tempe - CDN60 — 10:30 AM
+        if cur_open is None:
+            open_str = r.get("seats","?")
+            emoji = "⚪️"
+        else:
+            open_str = f"{cur_open}/{cur_tot}"
+            emoji = "🟢" if cur_open > 0 else "🔴"
+
+        instructor = r.get("instructor","").strip() or "TBA"
+        location   = r.get("location","").strip() or "-"
+        start_time = r.get("time","").strip() or "-"
+
         lines.append(
-            f'Class {nrc} — {r.get("course","")} — {r.get("instructor","")} — '
-            f'Open {open_str} {delta_txt} — {r.get("location","")} — {r.get("time","")}'
+            f'{emoji} Class {nrc} — {r.get("course","")} — {instructor} — '
+            f'{location} — {start_time} — Open {open_str} {delta_txt}'
         )
 
-    # Clases que ya no están
     removed = [o for k,o in old_map.items() if k not in new_map]
     if removed:
         gone = ", ".join(sorted([x.get("nrc","") for x in removed]))
         lines.append(f'Removed: {gone}')
 
-    # ¿Notificamos?
     if old_state.get("hash") != new_state["hash"]:
         notify("\n".join(lines) if lines else "No sections found (after filtering).")
         with open(STATE, "w") as f:
