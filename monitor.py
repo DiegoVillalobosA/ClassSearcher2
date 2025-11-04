@@ -1,20 +1,42 @@
 import os, json, hashlib, time, random, urllib.request, urllib.parse, sys, traceback, re
+from pathlib import Path
 from playwright.sync_api import sync_playwright
 
-# -------------------- utils --------------------
-def load_json_env(key: str, default_val):
-    raw = os.getenv(key)
-    if not raw or not raw.strip():
-        return default_val
-    try:
-        return json.loads(raw)
-    except Exception as e:
-        print(f"WARN: invalid {key}; using defaults. Error:", e)
-        return default_val
+# =========================
+# Config
+# =========================
+URL = os.getenv("URL", "https://catalog.apps.asu.edu/catalog/classes")
+QUERIES = json.loads(os.getenv("QUERIES_JSON", '[{"subject":"CSE","number":"412","term":"Spring 2026"}]'))
+
+# Filtro por ubicación (exclusión)
+LOCATION_EXCLUDE = os.getenv("LOCATION_EXCLUDE", "ASU Online").strip().lower() or None
+
+# Notificación “no changes” como keep-alive (1/hora por defecto)
+NOCHANGE_NOTIFY_INTERVAL_SEC = int(os.getenv("NOCHANGE_NOTIFY_INTERVAL_SEC", "3600"))
+
+# Jitter para que no sea exacto el intervalo real
+JITTER_MIN_SEC = int(os.getenv("JITTER_MIN_SEC", "0"))
+JITTER_MAX_SEC = int(os.getenv("JITTER_MAX_SEC", "240"))
+
+# Archivos de estado
+STATE = "state.json"                # snapshot de resultados
+META  = "notify_state.json"         # última vez que avisamos sin cambios
+DEBUG_DIR = "debug"
+VIDEO_DIR = "recordings"
+
+# Telegram
+TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+
+
+# =========================
+# Utilidades
+# =========================
+def hash_rows(rows):
+    return hashlib.sha256(json.dumps(rows, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 def notify(text: str):
-    TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-    TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+    """Envia a Telegram si hay token/chat; si falla, imprime."""
     if TG_TOKEN and TG_CHAT:
         try:
             data = urllib.parse.urlencode({"chat_id": TG_CHAT, "text": text}).encode()
@@ -24,25 +46,25 @@ def notify(text: str):
             print("WARN: Telegram send failed ->", e)
     print("NOTIFY:", text)
 
-def hash_rows(rows):
-    return hashlib.sha256(json.dumps(rows, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+def load_json(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-# -------------------- config --------------------
-URL = os.getenv("URL", "https://catalog.apps.asu.edu/catalog/classes")
-QUERIES = load_json_env("QUERIES_JSON", [{"subject":"CSE","number":"412","term":"Spring 2026"}])
-STATE = "state.json"
-DEBUG_DIR = "debug"
-VIDEO_DIR = "recordings"
+def save_json(path: str, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
 
-# Excluir SOLO estas ubicaciones (texto, case-insensitive)
-LOCATION_EXCLUDE = [s.strip().lower() for s in os.getenv("LOCATION_EXCLUDE", "ASU Online").split("|") if s.strip()]
+def parse_open_seats(seats_text: str):
+    """Convierte '2 of 170' -> 2 (int). Si no reconoce, devuelve None."""
+    if not seats_text:
+        return None
+    m = re.search(r'(\d+)\s+of\s+\d+', seats_text, flags=re.I)
+    return int(m.group(1)) if m else None
 
-# Jitter aleatorio (para que cada corrida no sea a minuto exacto)
-JITTER_MIN_SEC = int(os.getenv("JITTER_MIN_SEC", "300"))  # 5 min
-JITTER_MAX_SEC = int(os.getenv("JITTER_MAX_SEC", "600"))  # 10 min
-
-# -------------------- locator helpers --------------------
-def first_locator(page, kind, value, timeout=9000, name_regex=False):
+def first_locator(page, kind, value, timeout=12000, name_regex=False):
     import re as _re
     try:
         if kind == "label":
@@ -66,17 +88,17 @@ def first_locator(page, kind, value, timeout=9000, name_regex=False):
 def wait_hydrated(page, target_term_text: str):
     first_locator(page, "role", ("button", "Search Classes")).wait_for(state="visible", timeout=20000)
     try:
+        # Evita capturar la pantalla intermedia de "Previous Terms"
         page.wait_for_function(
             """(term) => {
                 const txt = document.body.innerText || '';
                 return (!txt.includes('Previous Terms')) || txt.includes(term);
             }""",
-            arg=target_term_text,
-            timeout=15000
+            arg=target_term_text, timeout=15000
         )
     except Exception:
         pass
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(400)
 
 def get_subject_input(page):
     for k, v in [
@@ -160,7 +182,9 @@ def click_search(page):
             break
     if not clicked:
         raise RuntimeError("No encontré el botón de búsqueda.")
-    page.keyboard.press("Enter")
+    # Enter de respaldo por si el click no dispara
+    try: page.keyboard.press("Enter")
+    except Exception: pass
     page.wait_for_timeout(800)
 
 def ensure_filters_applied(page, term, subj, num):
@@ -173,24 +197,17 @@ def ensure_filters_applied(page, term, subj, num):
     except Exception:
         return False
 
-# -------------------- resultados --------------------
-def wait_component_or_none(page):
-    for sel in ['[role="grid"]', '[role="table"]']:
-        try:
-            comp = page.locator(sel).first
-            comp.wait_for(state="visible", timeout=12000)
-            print(f"DEBUG: found {sel}")
-            return ("grid", comp) if sel == '[role="grid"]' else ("table-aria", comp)
-        except Exception:
-            continue
-    try:
-        tbl = page.locator("table").first
-        tbl.wait_for(state="visible", timeout=8000)
-        print("DEBUG: found <table>")
-        return ("table", tbl)
-    except Exception:
-        return (None, None)
+def reset_to_search(page, URL):
+    # Si hay "Clear filters", úsalo; si no, vuelve al buscador
+    btn = first_locator(page, "role", ("button", "Clear filters"))
+    if btn:
+        btn.click()
+        page.wait_for_timeout(300)
+        return
+    page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+    wait_hydrated(page, "")
 
+# ------- extracción de resultados -------
 def find_col(headers, needle):
     needle = needle.lower()
     for i, h in enumerate(headers):
@@ -201,89 +218,62 @@ def find_col(headers, needle):
 def extract_from_html_table(tbl):
     headers = [h.strip() for h in tbl.locator("th").all_inner_texts()]
     print(f"DEBUG: headers = {headers}")
-
     idx_course = find_col(headers, "course")
     idx_number = find_col(headers, "number")
     idx_open   = find_col(headers, "open seats")
     idx_start  = find_col(headers, "start") or find_col(headers, "time")
-    idx_instr  = find_col(headers, "instructor")
     idx_loc    = find_col(headers, "location")
-
-    # algunas filas traen celdas "extra" (expander / favoritos). Calculamos offset:
-    trs = tbl.locator("tbody tr")
-    if trs.count() == 0:
-        return []
-    first_tds = trs.nth(0).locator("td")
-    offset = max(0, first_tds.count() - len(headers))
-    print(f"DEBUG: column offset = {offset}")
-
-    def _get(texts, idx):
-        if idx is None: return ""
-        pos = offset + idx
-        return texts[pos] if 0 <= pos < len(texts) else ""
+    idx_instr  = find_col(headers, "instructor")
 
     rows = []
+    trs = tbl.locator("tbody tr")
     for i in range(trs.count()):
         tds = trs.nth(i).locator("td")
         texts = [tds.nth(j).inner_text().strip() for j in range(tds.count())]
-        instr = _get(texts, idx_instr)
-        # sanity: si por error es un número de 5-6 dígitos, no es profe
-        if re.fullmatch(r"\d{4,6}", instr or ""):
-            instr = ""
-        rows.append({
-            "nrc":        _get(texts, idx_number),
-            "course":     _get(texts, idx_course),
-            "seats":      _get(texts, idx_open),
-            "time":       _get(texts, idx_start),
-            "instructor": instr,
-            "location":   _get(texts, idx_loc),
-            "_raw":       texts
-        })
+        row = {
+            "nrc":    texts[idx_number] if idx_number is not None and idx_number < len(texts) else "",
+            "course": texts[idx_course] if idx_course is not None and idx_course < len(texts) else "",
+            "seats":  texts[idx_open]   if idx_open   is not None and idx_open   < len(texts) else "",
+            "time":   texts[idx_start]  if idx_start  is not None and idx_start  < len(texts) else "",
+            "loc":    texts[idx_loc]    if idx_loc    is not None and idx_loc    < len(texts) else "",
+            "instr":  texts[idx_instr]  if idx_instr  is not None and idx_instr  < len(texts) else "",
+        }
+        rows.append(row)
     return rows
 
 def extract_from_aria_grid(grid):
     headers = [h.strip() for h in grid.locator('[role="columnheader"]').all_inner_texts()]
     print(f"DEBUG: ARIA headers = {headers}")
-
     idx_course = find_col(headers, "course")
     idx_number = find_col(headers, "number")
     idx_open   = find_col(headers, "open seats")
     idx_start  = find_col(headers, "start") or find_col(headers, "time")
-    idx_instr  = find_col(headers, "instructor")
     idx_loc    = find_col(headers, "location")
-
-    all_rows = grid.locator('[role="row"]')
-    # primera fila real
-    first_cells = all_rows.nth(1).locator('[role="gridcell"], [role="cell"]') if all_rows.count() > 1 else grid.locator('[role="gridcell"], [role="cell"]')
-    offset = max(0, first_cells.count() - len(headers))
-    print(f"DEBUG: ARIA column offset = {offset}")
-
-    def _get(texts, idx):
-        if idx is None: return ""
-        pos = offset + idx
-        return texts[pos] if 0 <= pos < len(texts) else ""
+    idx_instr  = find_col(headers, "instructor")
 
     rows = []
+    all_rows = grid.locator('[role="row"]')
     for i in range(all_rows.count()):
         cells = all_rows.nth(i).locator('[role="gridcell"], [role="cell"]')
         if cells.count() == 0:
             continue
         texts = [cells.nth(j).inner_text().strip() for j in range(cells.count())]
-        instr = _get(texts, idx_instr)
-        if re.fullmatch(r"\d{4,6}", instr or ""):
-            instr = ""
-        rows.append({
-            "nrc":        _get(texts, idx_number),
-            "course":     _get(texts, idx_course),
-            "seats":      _get(texts, idx_open),
-            "time":       _get(texts, idx_start),
-            "instructor": instr,
-            "location":   _get(texts, idx_loc),
-            "_raw":       texts
-        })
+        row = {
+            "nrc":    texts[idx_number] if idx_number is not None and idx_number < len(texts) else "",
+            "course": texts[idx_course] if idx_course is not None and idx_course < len(texts) else "",
+            "seats":  texts[idx_open]   if idx_open   is not None and idx_open   < len(texts) else "",
+            "time":   texts[idx_start]  if idx_start  is not None and idx_start  < len(texts) else "",
+            "loc":    texts[idx_loc]    if idx_loc    is not None and idx_loc    < len(texts) else "",
+            "instr":  texts[idx_instr]  if idx_instr  is not None and idx_instr  < len(texts) else "",
+        }
+        rows.append(row)
     return rows
 
 def extract_textual(page, subj, num):
+    """
+    Fallback cuando no hay <table> ni ARIA grid.
+    Intenta extraer: NRC, título, open seats, hora, location, instructor.
+    """
     os.makedirs(DEBUG_DIR, exist_ok=True)
     body_txt = page.inner_text("body")
     with open(f"{DEBUG_DIR}/after-search-text.txt", "w", encoding="utf-8") as f:
@@ -291,59 +281,61 @@ def extract_textual(page, subj, num):
 
     lines = [l.strip() for l in body_txt.splitlines()]
     rows = []
-    course_pat = re.compile(rf'^{re.escape(subj)}\s+{re.escape(num)}\b', re.IGNORECASE)
-    weekday_line = re.compile(r'^(M|T|W|Th|F|Sa|Su|MW|TTh|M W|T Th)\b', re.IGNORECASE)
 
+    course_pat = re.compile(rf'^{re.escape(subj)}\s+{re.escape(num)}\b', re.IGNORECASE)
     i = 0
     while i < len(lines):
         if course_pat.search(lines[i]):
+            course_label = lines[i].strip()
+            # Título
             j = i + 1
             while j < len(lines) and not lines[j]:
                 j += 1
             title = lines[j].strip() if j < len(lines) else ""
 
-            instr = ""
+            # Buscar NRC y demás
             k = j + 1
-            for t in lines[k:k+8]:
-                if not t: continue
-                if weekday_line.search(t): continue
-                if re.search(r'\b(AM|PM)\b', t, re.IGNORECASE): continue
-                if "Open Seats" in t or "Add" == t: continue
-                if re.search(r'(Tempe|Downtown|West|Poly|Online|iCourse)', t, re.IGNORECASE): continue
-                if re.fullmatch(r"\d{4,6}", t): continue
-                instr = t; break
-
             nrc = ""
-            for t in lines[k:k+15]:
+            for t in lines[k:k+20]:
                 m = re.match(r'^\d{4,6}$', t)
                 if m: nrc = m.group(0); break
 
             open_seats = ""
-            for t in lines[k:k+25]:
+            for t in lines[k:k+30]:
                 m2 = re.search(r'(\d+)\s+of\s+(\d+)', t, re.IGNORECASE)
                 if m2: open_seats = f"{m2.group(1)} of {m2.group(2)}"; break
 
             start_time = ""
-            for t in lines[k:k+15]:
+            for t in lines[k:k+30]:
                 m3 = re.search(r'\b(\d{1,2}:\d{2}\s*(AM|PM))\b', t, re.IGNORECASE)
                 if m3: start_time = m3.group(1); break
 
-            location = ""
-            for t in lines[k:k+25]:
-                if re.search(r'\bASU\s+Online\b', t, re.IGNORECASE):
-                    location = "ASU Online"; break
-                m4 = re.search(r'(Tempe|Downtown|West|Poly)[^\n]*', t, re.IGNORECASE)
-                if m4: location = m4.group(0).strip(); break
-                if re.search(r'\biCourse\b', t, re.IGNORECASE) and not location:
-                    location = "iCourse"
+            # Location: línea con campus típico (Tempe, Downtown, West Valley, etc.)
+            loc = ""
+            for t in lines[k:k+30]:
+                if any(campus in t for campus in ["Tempe", "Downtown", "West Valley", "ASU Online", "Polytechnic", "West", "Online"]):
+                    loc = t.strip()
+                    break
+
+            # Instructor: heurística simple
+            instr = ""
+            for idx in range(k, min(k+30, len(lines))):
+                if re.search(r'Instructor', lines[idx], re.I):
+                    # siguiente no vacía
+                    p = idx + 1
+                    while p < len(lines) and not lines[p]:
+                        p += 1
+                    if p < len(lines):
+                        instr = lines[p].strip()
+                    break
 
             rows.append({
                 "nrc": nrc,
-                "course": f"{subj} {num} - {title}",
+                "course": f"{course_label} - {title}".strip(" -"),
                 "seats": open_seats,
                 "time": start_time,
-                "instructor": instr,
-                "location": location,
+                "loc": loc,
+                "instr": instr,
             })
             i = k + 10
             continue
@@ -351,6 +343,25 @@ def extract_textual(page, subj, num):
 
     print(f"DEBUG: textual rows found = {len(rows)}")
     return rows
+
+def wait_component_or_none(page):
+    # grid / table ARIA
+    for sel in ['[role="grid"]', '[role="table"]']:
+        try:
+            comp = page.locator(sel).first
+            comp.wait_for(state="visible", timeout=12000)
+            print(f"DEBUG: found {sel}")
+            return ("grid", comp) if sel == '[role="grid"]' else ("table-aria", comp)
+        except Exception:
+            continue
+    # table clásica
+    try:
+        tbl = page.locator("table").first
+        tbl.wait_for(state="visible", timeout=8000)
+        print("DEBUG: found <table>")
+        return ("table", tbl)
+    except Exception:
+        return (None, None)
 
 def extract_rows(page, subj, num):
     typ, comp = wait_component_or_none(page)
@@ -361,7 +372,9 @@ def extract_rows(page, subj, num):
     else:
         return extract_textual(page, subj, num)
 
-# -------------------- flujo principal --------------------
+# =========================
+# Lógica principal
+# =========================
 def apply_filters_and_search(page, subj, num, term, tries=3):
     for attempt in range(1, tries+1):
         print(f"DEBUG: attempt {attempt}")
@@ -375,31 +388,27 @@ def apply_filters_and_search(page, subj, num, term, tries=3):
             pass
         s_in.fill(subj)
         n_in.fill(num)
-
         set_term(page, term)
         click_search(page)
 
         page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(1000)
+        page.wait_for_timeout(900)
 
         if ensure_filters_applied(page, term, subj, num):
             return True
 
         print("DEBUG: filters not applied, retrying...")
         page.wait_for_timeout(700)
+        reset_to_search(page, URL)
+
     return False
 
-def parse_open_pair(s):
-    m = re.search(r'(\d+)\s*of\s*(\d+)', s or '', re.I)
-    return (int(m.group(1)), int(m.group(2))) if m else (None, None)
+def main():
+    # Jitter
+    if JITTER_MAX_SEC > 0 and JITTER_MAX_SEC >= JITTER_MIN_SEC:
+        time.sleep(random.uniform(JITTER_MIN_SEC, JITTER_MAX_SEC))
 
-def run():
-    # --- JITTER aleatorio 5-10 min ---
-    jitter = random.randint(JITTER_MIN_SEC, JITTER_MAX_SEC)
-    print(f"DEBUG: jitter sleep {jitter}s")
-    time.sleep(jitter)
-
-    os.makedirs(DEBUG_DIR, exist_ok=True)
+    Path(DEBUG_DIR).mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -409,6 +418,7 @@ def run():
 
         all_rows = []
         for q in QUERIES:
+            reset_to_search(page, URL)
             subj = q.get("subject","").strip()
             num  = q.get("number","").strip()
             term = q.get("term","").strip()
@@ -420,7 +430,7 @@ def run():
                 page.screenshot(path=f"{DEBUG_DIR}/failed-{subj}{num}.png", full_page=True)
                 with open(f"{DEBUG_DIR}/failed-{subj}{num}.html","w",encoding="utf-8") as f:
                     f.write(page.content())
-                raise RuntimeError("No se pudo aplicar filtros tras reintentos.")
+                raise RuntimeError(f"No se pudo aplicar filtros en {subj} {num} {term}")
 
             rows = extract_rows(page, subj, num)
             for r in rows:
@@ -430,77 +440,119 @@ def run():
         context.close()
         browser.close()
 
-    # Filtro: excluir "ASU Online"
+    # Filtro por ubicación (excluye ASU Online)
     if LOCATION_EXCLUDE:
-        all_rows = [r for r in all_rows if not any(x in (r.get("location","").lower()) for x in LOCATION_EXCLUDE)]
+        all_rows = [r for r in all_rows if LOCATION_EXCLUDE not in (r.get("loc","").lower())]
 
-    # Estado nuevo/antiguo
+    # armar snapshot nuevo
     new_state = {"hash": hash_rows(all_rows), "rows": all_rows, "ts": int(time.time())}
-    try:
-        old_state = json.load(open(STATE, "r"))
-    except Exception:
-        old_state = {"hash": None, "rows": []}
 
-    old_rows = old_state.get("rows", [])
-    old_map = {r.get("nrc"): r for r in old_rows if r.get("nrc")}
-    new_map = {r.get("nrc"): r for r in all_rows if r.get("nrc")}
+    # cargar estado previo
+    old_state = load_json(STATE, {"hash": None, "rows": []})
+    meta = load_json(META, {"last_nochange_ts": 0})
 
-    def parse_open_pair(s):
-        m = re.search(r'(\d+)\s*of\s*(\d+)', s or '', re.I)
-        return (int(m.group(1)), int(m.group(2))) if m else (None, None)
+    # Mapas por NRC (solo si NRC existe)
+    old_map = {r.get("nrc"): r for r in old_state.get("rows", []) if r.get("nrc")}
+    new_map = {r.get("nrc"): r for r in new_state["rows"] if r.get("nrc")}
 
-    # Construir mensaje SIEMPRE
-    header = f'Class Watch — {time.strftime("%Y-%m-%d %H:%M UTC")}'
-    lines = [header]
+    added   = [new_map[k] for k in (new_map.keys() - old_map.keys())]
+    removed = [old_map[k] for k in (old_map.keys() - new_map.keys())]
+    changed = []  # pares (old, new)
+    for k in (new_map.keys() & old_map.keys()):
+        a, b = old_map[k], new_map[k]
+        # Consideramos cambio si seats/time/loc/instr varió
+        if (a.get("seats"), a.get("time"), a.get("loc"), a.get("instr")) != (b.get("seats"), b.get("time"), b.get("loc"), b.get("instr")):
+            changed.append((a, b))
 
-    for nrc, r in sorted(new_map.items(), key=lambda kv: kv[0]):
-        cur_open, cur_tot = parse_open_pair(r.get("seats"))
-        prev = old_map.get(nrc)
-        if prev:
-            prev_open, _ = parse_open_pair(prev.get("seats"))
-            if prev_open is not None and cur_open is not None:
-                diff = cur_open - prev_open
-                delta_txt = f"(Δ {diff:+d})" if diff != 0 else "(same)"
-            else:
-                delta_txt = "(same)"
-        else:
-            delta_txt = "(new)"
+    # Marcar estado y delta por fila para el render
+    for k, row in new_map.items():
+        old = old_map.get(k)
+        open_now  = parse_open_seats(row.get("seats","") or "")
+        open_prev = parse_open_seats(old.get("seats","") or "") if old else None
+        delta = None
+        if open_now is not None and open_prev is not None:
+            delta = open_now - open_prev
+        # Emojis:
+        # estado principal
+        status = "🟢" if (open_now is not None and open_now > 0) else "🔴"
+        # update si cambió disponibilidad (delta != 0)
+        update = "🟠" if (delta is not None and delta != 0) else ""
+        row["_open_now"] = open_now
+        row["_delta"] = delta
+        row["_status"] = status
+        row["_update"] = update
 
-        if cur_open is None:
-            open_str = r.get("seats","?")
-            emoji = "⚪️"
-        else:
-            open_str = f"{cur_open}/{cur_tot}"
-            emoji = "🟢" if cur_open > 0 else "🔴"
+    # ¿Hubo cambios?
+    any_change = bool(added or removed or changed)
 
-        instructor = (r.get("instructor","") or "TBA").strip()
-        location   = (r.get("location","") or "-").strip()
-        start_time = (r.get("time","") or "-").strip()
+    # Mensaje
+    # agrupamos por query
+    by_query = {}
+    for r in new_state["rows"]:
+        by_query.setdefault(r.get("_query","?"), []).append(r)
 
-        lines.append(
-            f'{emoji} Class {nrc} — {r.get("course","")} — {instructor} — '
-            f'{location} — {start_time} — Open {open_str} {delta_txt}'
-        )
+    lines = []
+    header = "🔔 **CHANGES**" if any_change else "⏱️ Hourly check (no changes)"
+    lines.append(header)
 
-    removed = [o for k,o in old_map.items() if k not in new_map]
+    for qkey, rows in by_query.items():
+        # Qkey = "CSE412-Spring 2026"
+        lines.append(f"\n— {qkey} —")
+        # orden por open seats desc, luego NRC
+        rows_sorted = sorted(rows, key=lambda x: (-(x.get("_open_now") or -1), str(x.get("nrc",""))))
+        for r in rows_sorted:
+            nrc   = r.get("nrc","")
+            course= r.get("course","")
+            seats = r.get("seats","?")
+            loc   = r.get("loc","").strip()
+            time_ = r.get("time","").strip()
+            instr = r.get("instr","").strip()
+            delta = r.get("_delta")
+            delta_txt = f"(Δ{delta:+d})" if isinstance(delta,int) and delta!=0 else "(same)"
+            # 🔴/🟢 + 🟠 si hubo variación de disponibilidad
+            prefix = f'{r.get("_status","")} {r.get("_update","")}'.strip()
+            line = f'{prefix} NRC {nrc} — {course} — Open {seats} {delta_txt}'
+            if loc:   line += f' — {loc}'
+            if time_: line += f' — {time_}'
+            if instr: line += f' — {instr}'
+            lines.append(line)
+
+    # añadimos altas/bajas explícitas
+    if added:
+        for r in added[:6]:
+            lines.append(f'➕ NEW NRC {r.get("nrc","")} — {r.get("course","")}')
     if removed:
-        gone = ", ".join(sorted([x.get("nrc","") for x in removed]))
-        lines.append(f'Removed: {gone}')
+        for r in removed[:6]:
+            lines.append(f'➖ REMOVED NRC {r.get("nrc","")} — {r.get("course","")}')
 
-    # Enviar SIEMPRE
-    notify("\n".join(lines) if len(lines) > 1 else "No sections found (after filtering).")
+    message = "\n".join(lines)
 
-    # Solo actualizar state cuando cambie
-    if old_state.get("hash") != new_state["hash"]:
-        with open(STATE, "w") as f:
-            json.dump(new_state, f)
-        print("CHANGED")
+    # Política de notificación:
+    # - Si hay cambios: notificar siempre y resetear reloj
+    # - Si NO hay cambios: notificar sólo si pasó >= NOCHANGE_NOTIFY_INTERVAL_SEC desde el último ping
+    now = int(time.time())
+    should_notify = False
+    if any_change:
+        should_notify = True
+        meta["last_nochange_ts"] = now  # reset
     else:
-        print("NOCHANGE") 
+        if now - meta.get("last_nochange_ts", 0) >= NOCHANGE_NOTIFY_INTERVAL_SEC:
+            should_notify = True
+            meta["last_nochange_ts"] = now
 
-if __name__ == "__main__":
+    if should_notify:
+        notify(message)
+
+    # Guardar estados
+    save_json(STATE, new_state)
+    save_json(META, meta)
+
+def run():
     try:
-        run()
+        main()
     except Exception:
         print("ERROR:\n", traceback.format_exc())
         sys.exit(1)
+
+if __name__ == "__main__":
+    run()
