@@ -2,7 +2,7 @@ import os, json, hashlib, time, random, urllib.request, urllib.parse, sys, trace
 from playwright.sync_api import sync_playwright
 
 # =========================
-# Utilidades básicas
+# Utilidades
 # =========================
 def load_json_env(key: str, default_val):
     raw = os.getenv(key)
@@ -37,19 +37,28 @@ QUERIES = load_json_env("QUERIES_JSON", [
     {"subject":"CSE","number":"412","term":"Spring 2026"}
 ])
 
-# Excluir SOLO “ASU Online”. Puedes cambiarlo en el workflow con LOCATION_EXCLUDE_REGEX.
-# iCourse NO se excluye.
+# Solo excluir “ASU Online” (iCourse SÍ entra)
 LOCATION_EXCLUDE_REGEX = os.getenv("LOCATION_EXCLUDE_REGEX", r"(?i)\bASU\s*Online\b")
 
 STATE = "state.json"
-NOTIFY_STATE = "notify_state.json"   # para el ping horario
+NOTIFY_STATE = "notify_state.json"   # <-- FICHERO NUEVO: persistimos el último ping de “no cambios”
 DEBUG_DIR = "debug"
 VIDEO_DIR = "recordings"
 
-# Jitter y pings
+# Jitter anti-patrón exacto
 JITTER_MIN = int(os.getenv("JITTER_MIN_SEC", "0"))
 JITTER_MAX = int(os.getenv("JITTER_MAX_SEC", "240"))
+
+# Ping “no change” cada X segundos (default 1h)
 NOCHANGE_NOTIFY_INTERVAL = int(os.getenv("NOCHANGE_NOTIFY_INTERVAL_SEC", "3600"))
+# Permitir desactivar pings de no-cambios si quieres (1=on, 0=off)
+NOCHANGE_PING = int(os.getenv("NOCHANGE_PING", "1"))
+
+# ======== TRIGGERS configurables ========
+# Notificar si pasa 0 -> >=1 asientos
+TRIGGER_ZERO_TO_POSITIVE = int(os.getenv("TRIGGER_ZERO_TO_POSITIVE", "1"))  # 1=on
+# Notificar si caen >= este umbral de golpe
+TRIGGER_DROP_THRESHOLD = int(os.getenv("TRIGGER_DROP_THRESHOLD", "5"))      # e.g., 5
 
 # =========================
 # Helpers de localización
@@ -81,7 +90,6 @@ def wait_hydrated(page, target_term_text: str):
         page.wait_for_function(
             """(term) => {
                 const txt = document.body.innerText || '';
-                // cuando está "hidratado" ya no queda pegado en "Previous Terms"
                 return (!txt.includes('Previous Terms')) || txt.includes(term);
             }""",
             arg=target_term_text,
@@ -101,8 +109,7 @@ def get_subject_input(page):
         ("css", 'input[id*="subject" i]'),
     ]:
         loc = first_locator(page, k, v)
-        if loc:
-            return loc
+        if loc: return loc
     raise RuntimeError("No se encontró el campo 'Subject'.")
 
 def get_number_input(page):
@@ -119,8 +126,7 @@ def get_number_input(page):
         ("css", 'input[id*="catalog" i]'),
     ]:
         loc = first_locator(page, k, v)
-        if loc:
-            return loc
+        if loc: return loc
     raise RuntimeError("No se encontró el campo 'Number'.")
 
 def set_term(page, term_label_text):
@@ -167,7 +173,7 @@ def click_search(page):
             break
     if not clicked:
         raise RuntimeError("No encontré el botón de búsqueda.")
-    page.keyboard.press("Enter")   # respaldo
+    page.keyboard.press("Enter")
     page.wait_for_timeout(800)
 
 def ensure_filters_applied(page, term, subj, num):
@@ -189,7 +195,6 @@ def find_col(headers, needle):
     return None
 
 def parse_open_seats(s: str):
-    # "2 of 170" -> (2,170)
     m = re.search(r'(\d+)\s*of\s*(\d+)', s or "", re.I)
     if m:
         return int(m.group(1)), int(m.group(2))
@@ -201,18 +206,16 @@ def should_exclude_location(location_text: str) -> bool:
     try:
         return re.search(LOCATION_EXCLUDE_REGEX, location_text, flags=re.I) is not None
     except re.error:
-        # si la regex de env es inválida, no excluye nada
         return False
 
 def extract_from_table_like(component, is_aria=False):
-    # Cabeceras
     headers = [h.strip() for h in (
         component.locator('[role="columnheader"]') if is_aria else component.locator('th')
     ).all_inner_texts()]
-    # índices relevantes
+
     idx_course = find_col(headers, "course")
     idx_title  = find_col(headers, "title")
-    idx_num    = find_col(headers, "number")          # Class #
+    idx_num    = find_col(headers, "number")
     idx_instr  = find_col(headers, "instructor")
     idx_days   = find_col(headers, "days")
     idx_start  = find_col(headers, "start")
@@ -236,7 +239,7 @@ def extract_from_table_like(component, is_aria=False):
 
         course = get(idx_course)
         title  = get(idx_title)
-        num    = get(idx_num)          # este es el "Class #" (antes le decíamos NRC)
+        num    = get(idx_num)          # Class #
         instr  = get(idx_instr)
         days   = get(idx_days)
         start  = get(idx_start)
@@ -244,15 +247,14 @@ def extract_from_table_like(component, is_aria=False):
         loc    = get(idx_loc)
         open_s = get(idx_open)
 
-        # Filtro: excluir SOLO ASU Online
         if should_exclude_location(loc):
             continue
 
         open_now, open_tot = parse_open_seats(open_s)
         rows.append({
-            "class_id": num,             # en vez de "nrc"
-            "course": course,            # "CSE 412"
-            "title": title,              # "Database Management"
+            "class_id": num,
+            "course": course,
+            "title": title,
             "instructor": instr,
             "days": days,
             "start": start,
@@ -265,7 +267,6 @@ def extract_from_table_like(component, is_aria=False):
     return rows
 
 def extract_textual(page, subj, num):
-    """Fallback cuando no hay tabla — también incluye iCourse."""
     body_txt = page.inner_text("body")
     lines = [l.strip() for l in body_txt.splitlines()]
     rows = []
@@ -274,14 +275,12 @@ def extract_textual(page, subj, num):
     i = 0
     while i < len(lines):
         if course_pat.search(lines[i]):
-            course_label = lines[i].strip()           # "CSE 412"
-            # título
+            course_label = lines[i].strip()
             j = i + 1
             while j < len(lines) and not lines[j]:
                 j += 1
             title = lines[j] if j < len(lines) else ""
 
-            # class_id (5-6 dígitos)
             k = j + 1
             class_id = ""
             for t in lines[k:k+15]:
@@ -289,23 +288,19 @@ def extract_textual(page, subj, num):
                 if m:
                     class_id = m.group(0); break
 
-            # open seats
             open_text = ""
             for t in lines[k:k+25]:
                 m2 = re.search(r'(\d+)\s+of\s+(\d+)', t, re.I)
                 if m2:
                     open_text = f"{m2.group(1)} of {m2.group(2)}"; break
-
             open_now, open_tot = parse_open_seats(open_text)
 
-            # hora (si existe)
             start_time = ""
             for t in lines[k:k+15]:
                 m3 = re.search(r'\b(\d{1,2}:\d{2}\s*(AM|PM))\b', t, re.I)
                 if m3:
                     start_time = m3.group(1); break
 
-            # location (busca una línea con campus/sala o “iCourse”)
             loc = ""
             for t in lines[k:k+20]:
                 if " - " in t or "iCourse" in t:
@@ -331,7 +326,6 @@ def extract_textual(page, subj, num):
     return rows
 
 def wait_component_or_none(page):
-    # ARIA grid/table
     for sel in ['[role="grid"]', '[role="table"]']:
         try:
             comp = page.locator(sel).first
@@ -339,7 +333,6 @@ def wait_component_or_none(page):
             return ("aria", comp)
         except Exception:
             continue
-    # table clásica
     try:
         tbl = page.locator("table").first
         tbl.wait_for(state="visible", timeout=8000)
@@ -360,7 +353,6 @@ def extract_rows(page, subj, num):
 # Flujo principal
 # =========================
 def reset_search(page):
-    # intenta "Clear filters"; si no, vuelve al inicio
     btn = first_locator(page, "text", "Clear filters", timeout=2000)
     if btn:
         try: btn.click()
@@ -389,51 +381,41 @@ def apply_filters_and_search(page, subj, num, term, tries=3):
         reset_search(page)
     return False
 
-def group_key(q):  # p.ej. "CSE412-Spring 2026"
+def group_key(q):
     return f'{q["subject"]}{q["number"]}-{q["term"]}'
 
-def format_line(r, prev=None):
-    # iconos
+def format_line(r, prev=None, triggered=False):
     green = (r["open_now"] or 0) > 0
     dot = "🟢" if green else "🔴"
+    if triggered:
+        dot += " 🟠"  # solo si el cambio cumple trigger
 
-    # Δ de seats
-    delta_txt = "(same)"
-    changed_icon = ""
+    # Δ visible solo si hay prev y cambió seats
+    delta_txt = ""
     if prev is not None:
-        prev_open = prev.get("open_now", 0) or 0
-        now_open = r["open_now"] or 0
-        d = now_open - prev_open
+        po = prev.get("open_now", 0) or 0
+        no = r.get("open_now", 0) or 0
+        d = no - po
         if d != 0:
-            changed_icon = " 🟠"
-            delta_txt = f'(Δ{("+" if d>0 else "")}{d})'
+            delta_txt = f' (Δ{("+" if d>0 else "")}{d})'
 
-    # piezas
-    class_id = (r.get("class_id") or "").strip()
-    course   = (r.get("course") or "").strip()
-    title    = (r.get("title") or "").strip()
-    seats    = (r.get("open_text") or "").strip() or (f'{r["open_now"]} of {r["open_total"]}' if r.get("open_total") else f'{r["open_now"]}')
-    loc      = (r.get("location") or "").strip()
-    start    = (r.get("start") or "").strip()
-    instr    = (r.get("instructor") or "").strip()
-
+    seats = r.get("open_text") or (f'{r["open_now"]} of {r["open_total"]}' if r.get("open_total") else f'{r["open_now"]}')
     pieces = [
-        f"{dot}{changed_icon} Class #{class_id}" if class_id else f"{dot}{changed_icon}",
-        f"{course} - {title}".strip(" -"),
-        f"Open {seats} {delta_txt}",
+        f'Class #{(r.get("class_id") or "").strip()}',
+        f'{(r.get("course") or "").strip()} - {(r.get("title") or "").strip()}'.strip(" -"),
+        f'Open {seats}{delta_txt}',
     ]
-    if loc:
-        pieces.append(loc)
-    if start:
-        pieces.append(start)
-    if instr:
-        pieces.append(instr)
-
-    return " — ".join(pieces)
+    if r.get("location"):
+        pieces.append(r["location"].strip())
+    if r.get("start"):
+        pieces.append(r["start"].strip())
+    if r.get("instructor"):
+        pieces.append(r["instructor"].strip())
+    return f'{dot} ' + " — ".join(pieces)
 
 def run():
-    # Jitter anti-patrón exacto
-    if JITTER_MAX > 0 and JITTER_MAX >= JITTER_MIN:
+    # Jitter
+    if JITTER_MAX >= JITTER_MIN and JITTER_MAX > 0:
         time.sleep(random.uniform(JITTER_MIN, JITTER_MAX))
 
     os.makedirs(DEBUG_DIR, exist_ok=True)
@@ -454,46 +436,53 @@ def run():
 
             ok = apply_filters_and_search(page, subj, num, term, tries=3)
             if not ok:
-                # artefactos solo en fallo
                 context.close(); browser.close()
                 raise RuntimeError(f"No se pudo aplicar filtros para {subj} {num} ({term})")
 
             rows = extract_rows(page, subj, num)
-            # anota a qué consulta pertenece
             for r in rows:
                 r["_q"] = group_key(q)
             all_rows.extend(rows)
 
-            # pequeño respiro entre cursos
             page.wait_for_timeout(600)
             reset_search(page)
 
         context.close()
         browser.close()
 
-    # ===== Diff vs estado anterior =====
+    # ===== Estado actual vs anterior
     new_state = {"hash": hash_rows(all_rows), "rows": all_rows, "ts": int(time.time())}
     try:
         old_state = json.load(open(STATE, "r"))
     except Exception:
         old_state = {"hash": None, "rows": []}
 
-    # index por class_id
     prev_by_id = {r.get("class_id"): r for r in old_state.get("rows", []) if r.get("class_id")}
     curr_by_id = {r.get("class_id"): r for r in new_state["rows"] if r.get("class_id")}
 
-    added   = [curr_by_id[k] for k in (curr_by_id.keys() - prev_by_id.keys())]
-    removed = [prev_by_id[k] for k in (prev_by_id.keys() - curr_by_id.keys())]
-    changed = []
+    # ==== TRIGGERS de notificación ====
+    # Solo consideramos “cambios interesantes”:
+    #  - 0 -> >=1 (si TRIGGER_ZERO_TO_POSITIVE=1)
+    #  - caída >= TRIGGER_DROP_THRESHOLD
+    triggered_ids = set()
     for k in (curr_by_id.keys() & prev_by_id.keys()):
-        a, b = prev_by_id[k], curr_by_id[k]
-        # cambio si varía seats, hora, location o instructor
-        if (a.get("open_now"), a.get("start"), a.get("location"), a.get("instructor")) != \
-           (b.get("open_now"), b.get("start"), b.get("location"), b.get("instructor")):
-            changed.append((a, b))
+        prev = prev_by_id[k]
+        curr = curr_by_id[k]
+        po = prev.get("open_now", 0) or 0
+        no = curr.get("open_now", 0) or 0
+        fired = False
 
-    # ===== Formato de mensaje =====
-    # agrupar por consulta y ordenar por asientos abiertos desc
+        if TRIGGER_ZERO_TO_POSITIVE and po == 0 and no > 0:
+            fired = True
+        elif (po - no) >= TRIGGER_DROP_THRESHOLD:
+            fired = True
+
+        if fired:
+            triggered_ids.add(k)
+
+    any_change = len(triggered_ids) > 0
+
+    # Agrupar y ordenar para impresión
     groups = {}
     for r in all_rows:
         groups.setdefault(r["_q"], []).append(r)
@@ -501,23 +490,17 @@ def run():
         g.sort(key=lambda x: (x.get("open_now") or 0), reverse=True)
 
     lines = []
-    any_change = bool(added or removed or changed)
-    header = "🔔 **CHANGES**" if any_change else "⏱️ **Hourly check (no changes)**"
+    header = "🔔 **CHANGES (triggered)**" if any_change else "⏱️ **Hourly check (no changes)**"
     lines.append(header)
 
     for qkey in sorted(groups.keys()):
         lines.append(f"\n— {qkey} —")
         for r in groups[qkey]:
             prev = prev_by_id.get(r.get("class_id"))
-            lines.append(format_line(r, prev=prev))
+            trig = r.get("class_id") in triggered_ids
+            lines.append(format_line(r, prev=prev, triggered=trig))
 
-    # añadidos / eliminados
-    for r in added[:10]:
-        lines.append(f"➕ NEW Class #{r.get('class_id','')} — {r.get('course','')} - {r.get('title','')}")
-    for r in removed[:10]:
-        lines.append(f"➖ REMOVED Class #{r.get('class_id','')} — {r.get('course','')} - {r.get('title','')}")
-
-    # ===== Lógica de notificación (inmediata o 1/hora) =====
+    # ===== Pinging horario y guardado de estado
     now = int(time.time())
     try:
         notify_state = json.load(open(NOTIFY_STATE, "r"))
@@ -527,16 +510,16 @@ def run():
     if any_change:
         notify("\n".join(lines))
         with open(STATE, "w") as f: json.dump(new_state, f)
-        notify_state["last_nochange_ping"] = now
+        notify_state["last_nochange_ping"] = now   # reset del reloj horario
         with open(NOTIFY_STATE, "w") as f: json.dump(notify_state, f)
         print("CHANGED")
     else:
-        # ping cada hora
-        if now - notify_state.get("last_nochange_ping", 0) >= NOCHANGE_NOTIFY_INTERVAL:
+        with open(STATE, "w") as f: json.dump(new_state, f)
+        # solo pings horarios si están habilitados
+        if NOCHANGE_PING and (now - notify_state.get("last_nochange_ping", 0) >= NOCHANGE_NOTIFY_INTERVAL):
             notify("\n".join(lines))
             notify_state["last_nochange_ping"] = now
             with open(NOTIFY_STATE, "w") as f: json.dump(notify_state, f)
-        with open(STATE, "w") as f: json.dump(new_state, f)
         print("NOCHANGE")
 
 if __name__ == "__main__":
