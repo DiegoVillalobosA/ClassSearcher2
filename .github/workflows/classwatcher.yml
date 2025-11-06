@@ -42,11 +42,16 @@ jobs:
               {"subject":"CSE","number":"412","term":"Spring 2026"},
               {"subject":"CSE","number":"434","term":"Spring 2026"}
             ]
-          LOCATION_EXCLUDE: ASU Online
-          # si ya tenías estas, mantenlas:
+          LOCATION_EXCLUDE_REGEX: "(?i)\\bASU\\s*Online\\b"
+          # Jitter 5–10 min (300–600 s) si quieres variar inicio
           JITTER_MIN_SEC: "0"
-          JITTER_MAX_SEC: "240"
+          JITTER_MAX_SEC: "0"
+          # Hourly ping ON y a 3600 s (1h)
+          NOCHANGE_PING: "1"
           NOCHANGE_NOTIFY_INTERVAL_SEC: "3600"
+          # Triggers pedidos
+          TRIGGER_ZERO_TO_POSITIVE: "1"
+          TRIGGER_DROP_THRESHOLD: "5"
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor.py
@@ -77,7 +82,7 @@ jobs:
           if [ -n "$(git status --porcelain)" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add state.json
+            git add state.json notify_state.json
             git commit -m "update state [skip ci]" || true
             git push
           fi
