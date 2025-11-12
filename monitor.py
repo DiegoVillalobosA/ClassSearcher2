@@ -41,24 +41,23 @@ QUERIES = load_json_env("QUERIES_JSON", [
 LOCATION_EXCLUDE_REGEX = os.getenv("LOCATION_EXCLUDE_REGEX", r"(?i)\bASU\s*Online\b")
 
 STATE = "state.json"
-NOTIFY_STATE = "notify_state.json"   # <-- FICHERO NUEVO: persistimos el último ping de “no cambios”
+NOTIFY_STATE = "notify_state.json"   # persistimos último ping “no cambios”
 DEBUG_DIR = "debug"
 VIDEO_DIR = "recordings"
 
-# Jitter anti-patrón exacto
+# Jitter anti-patrón exacto (puedes definir JITTER_MIN_SEC/JITTER_MAX_SEC en el workflow)
 JITTER_MIN = int(os.getenv("JITTER_MIN_SEC", "0"))
-JITTER_MAX = int(os.getenv("JITTER_MAX_SEC", "240"))
+JITTER_MAX = int(os.getenv("JITTER_MAX_SEC", "0"))
 
-# Ping “no change” cada X segundos (default 1h)
+# Ping “no change” cada X segundos (default 1h). 1=habilitado / 0=deshabilitado.
 NOCHANGE_NOTIFY_INTERVAL = int(os.getenv("NOCHANGE_NOTIFY_INTERVAL_SEC", "3600"))
-# Permitir desactivar pings de no-cambios si quieres (1=on, 0=off)
 NOCHANGE_PING = int(os.getenv("NOCHANGE_PING", "1"))
 
 # ======== TRIGGERS configurables ========
 # Notificar si pasa 0 -> >=1 asientos
-TRIGGER_ZERO_TO_POSITIVE = int(os.getenv("TRIGGER_ZERO_TO_POSITIVE", "1"))  # 1=on
+TRIGGER_ZERO_TO_POSITIVE = int(os.getenv("TRIGGER_ZERO_TO_POSITIVE", "1"))
 # Notificar si caen >= este umbral de golpe
-TRIGGER_DROP_THRESHOLD = int(os.getenv("TRIGGER_DROP_THRESHOLD", "5"))      # e.g., 5
+TRIGGER_DROP_THRESHOLD = int(os.getenv("TRIGGER_DROP_THRESHOLD", "5"))
 
 # =========================
 # Helpers de localización
@@ -414,7 +413,7 @@ def format_line(r, prev=None, triggered=False):
     return f'{dot} ' + " — ".join(pieces)
 
 def run():
-    # Jitter
+    # Jitter opcional
     if JITTER_MAX >= JITTER_MIN and JITTER_MAX > 0:
         time.sleep(random.uniform(JITTER_MIN, JITTER_MAX))
 
@@ -461,44 +460,25 @@ def run():
     curr_by_id = {r.get("class_id"): r for r in new_state["rows"] if r.get("class_id")}
 
     # ==== TRIGGERS de notificación ====
-    # Solo consideramos “cambios interesantes”:
-    #  - 0 -> >=1 (si TRIGGER_ZERO_TO_POSITIVE=1)
-    #  - caída >= TRIGGER_DROP_THRESHOLD
     triggered_ids = set()
     for k in (curr_by_id.keys() & prev_by_id.keys()):
         prev = prev_by_id[k]
         curr = curr_by_id[k]
         po = prev.get("open_now", 0) or 0
         no = curr.get("open_now", 0) or 0
-        fired = False
-
         if TRIGGER_ZERO_TO_POSITIVE and po == 0 and no > 0:
-            fired = True
+            triggered_ids.add(k)
         elif (po - no) >= TRIGGER_DROP_THRESHOLD:
-            fired = True
-
-        if fired:
             triggered_ids.add(k)
 
     any_change = len(triggered_ids) > 0
 
-    # Agrupar y ordenar para impresión
+    # Agrupar para impresión
     groups = {}
     for r in all_rows:
         groups.setdefault(r["_q"], []).append(r)
     for g in groups.values():
         g.sort(key=lambda x: (x.get("open_now") or 0), reverse=True)
-
-    lines = []
-    header = "🔔 **CHANGES (triggered)**" if any_change else "⏱️ **Hourly check (no changes)**"
-    lines.append(header)
-
-    for qkey in sorted(groups.keys()):
-        lines.append(f"\n— {qkey} —")
-        for r in groups[qkey]:
-            prev = prev_by_id.get(r.get("class_id"))
-            trig = r.get("class_id") in triggered_ids
-            lines.append(format_line(r, prev=prev, triggered=trig))
 
     # ===== Pinging horario y guardado de estado
     now = int(time.time())
@@ -508,16 +488,28 @@ def run():
         notify_state = {"last_nochange_ping": 0}
 
     if any_change:
+        # Mensaje SOLO con líneas afectadas por triggers
+        lines = ["🔔 **CHANGES**"]
+        for qkey in sorted(groups.keys()):
+            chunk = []
+            for r in groups[qkey]:
+                if r.get("class_id") in triggered_ids:
+                    prev = prev_by_id.get(r.get("class_id"))
+                    chunk.append(format_line(r, prev=prev, triggered=True))
+            if chunk:
+                lines.append(f"\n— {qkey} —")
+                lines.extend(chunk)
+
         notify("\n".join(lines))
         with open(STATE, "w") as f: json.dump(new_state, f)
         notify_state["last_nochange_ping"] = now   # reset del reloj horario
         with open(NOTIFY_STATE, "w") as f: json.dump(notify_state, f)
         print("CHANGED")
     else:
+        # Guardamos estado igual, pero el ping horario es MINIMAL
         with open(STATE, "w") as f: json.dump(new_state, f)
-        # solo pings horarios si están habilitados
         if NOCHANGE_PING and (now - notify_state.get("last_nochange_ping", 0) >= NOCHANGE_NOTIFY_INTERVAL):
-            notify("\n".join(lines))
+            notify("⏰ Hourly update: no changes.")
             notify_state["last_nochange_ping"] = now
             with open(NOTIFY_STATE, "w") as f: json.dump(notify_state, f)
         print("NOCHANGE")
