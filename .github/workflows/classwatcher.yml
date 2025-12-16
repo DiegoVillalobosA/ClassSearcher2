@@ -41,6 +41,8 @@ jobs:
               {"subject":"MAT","number":"343","term":"Spring 2026"},
               {"subject":"CSE","number":"412","term":"Spring 2026"},
               {"subject":"CSE","number":"434","term":"Spring 2026"}
+              {"subject":"IEE","number":"380","term":"Spring 2026"}
+
             ]
           LOCATION_EXCLUDE_REGEX: "(?i)\\bASU\\s*Online\\b"
           # Jitter 5–10 min (300–600 s) si quieres variar inicio
